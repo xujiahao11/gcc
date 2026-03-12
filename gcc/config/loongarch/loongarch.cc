@@ -897,7 +897,7 @@ loongarch_compute_frame_info (void)
 {
   struct loongarch_frame_info *frame;
   HOST_WIDE_INT offset;
-  unsigned int regno, i, num_x_saved = 0, num_f_saved = 0;
+  unsigned int regno, i, num_x_saved = 0, num_f_saved = 0, num_x_saved_in_fp = 0;
 
   frame = &cfun->machine->frame;
   memset (frame, 0, sizeof (*frame));
@@ -920,6 +920,28 @@ loongarch_compute_frame_info (void)
       if (loongarch_save_reg_p (regno))
 	frame->fmask |= 1 << (regno - FP_REG_FIRST), num_f_saved++;
 
+  if (TARGET_HARD_FLOAT && TARGET_CALLEE_SAVE_GPR_IN_FPR
+      && !crtl->calls_eh_return)
+    {
+      /* Only use untouched callee-saved FPRs as temporary save slots.  */
+      for (regno = GP_REG_FIRST; regno <= GP_REG_LAST; regno++)
+	if (BITSET_P (frame->mask, regno - GP_REG_FIRST))
+	  for (unsigned int fp_regno = FP_REG_FIRST + 24;
+	       fp_regno <= FP_REG_FIRST + 31;
+	       fp_regno++)
+	    if (!BITSET_P (frame->fmask, fp_regno - FP_REG_FIRST)
+		&& !df_regs_ever_live_p (fp_regno)
+		&& !global_regs[fp_regno])
+	      {
+		frame->gpr_saved_in_fp[regno - GP_REG_FIRST]
+		  = fp_regno - FP_REG_FIRST + 1;
+		num_x_saved_in_fp++;
+		frame->fmask |= 1 << (fp_regno - FP_REG_FIRST);
+		num_f_saved++;
+		break;
+	      }
+    }
+
   /* At the bottom of the frame are any outgoing stack arguments.  */
   offset = LARCH_STACK_ALIGN (crtl->outgoing_args_size);
   /* Next are local stack variables.  */
@@ -937,16 +959,18 @@ loongarch_compute_frame_info (void)
   /* Next are the callee-saved GPRs.  */
   if (frame->mask)
     {
-      unsigned x_save_size = LARCH_STACK_ALIGN (num_x_saved * UNITS_PER_WORD);
+      unsigned x_save_size = LARCH_STACK_ALIGN ((num_x_saved - num_x_saved_in_fp)
+					* UNITS_PER_WORD);
       unsigned num_save_restore
 	= 1 + loongarch_save_libcall_count (frame->mask);
 
       /* Only use save/restore routines if they don't alter the stack size.  */
-      if (LARCH_STACK_ALIGN (num_save_restore * UNITS_PER_WORD) == x_save_size)
+      if (num_x_saved_in_fp == 0
+	  && LARCH_STACK_ALIGN (num_save_restore * UNITS_PER_WORD) == x_save_size)
 	frame->save_libcall_adjustment = x_save_size;
 
       offset += x_save_size;
-      frame->gp_sp_offset = offset - UNITS_PER_WORD;
+      frame->gp_sp_offset = x_save_size > 0 ? offset - UNITS_PER_WORD : offset;
     }
   else
     frame->gp_sp_offset = offset;
@@ -1013,6 +1037,42 @@ loongarch_save_restore_reg (machine_mode mode, int regno, HOST_WIDE_INT offset,
   fn (gen_rtx_REG (mode, regno), mem);
 }
 
+static bool
+loongarch_reg_saved_in_fpr_p (int regno)
+{
+  return cfun->machine->frame.gpr_saved_in_fp[regno - GP_REG_FIRST] != 0;
+}
+
+static int
+loongarch_gpr_save_fpr (int regno)
+{
+  unsigned int enc = cfun->machine->frame.gpr_saved_in_fp[regno - GP_REG_FIRST];
+  gcc_assert (enc != 0);
+  return FP_REG_FIRST + enc - 1;
+}
+
+static void
+loongarch_save_restore_gpr_in_fpr (bool save_p, bool skip_eh_data_regs_p)
+{
+  machine_mode mode = TARGET_64BIT ? DImode : SImode;
+
+  for (int regno = GP_REG_FIRST; regno <= GP_REG_LAST; regno++)
+    if (BITSET_P (cfun->machine->frame.mask, regno - GP_REG_FIRST)
+	&& loongarch_reg_saved_in_fpr_p (regno)
+	&& !cfun->machine->reg_is_wrapped_separately[regno]
+	&& !(skip_eh_data_regs_p
+	     && GP_ARG_FIRST <= regno && regno < GP_ARG_FIRST + 4))
+      {
+	rtx gpr = gen_rtx_REG (mode, regno);
+	rtx fpr = gen_rtx_REG (mode, loongarch_gpr_save_fpr (regno));
+
+	if (save_p)
+	  loongarch_emit_move (fpr, gpr);
+	else
+	  loongarch_emit_move (gpr, fpr);
+      }
+}
+
 /* Call FN for each register that is saved by the current function.
    SP_OFFSET is the offset of the current stack pointer from the start
    of the frame.  */
@@ -1027,7 +1087,8 @@ loongarch_for_each_saved_reg (HOST_WIDE_INT sp_offset,
   /* Save the link register and s-registers.  */
   offset = cfun->machine->frame.gp_sp_offset - sp_offset;
   for (int regno = GP_REG_FIRST; regno <= GP_REG_LAST; regno++)
-    if (BITSET_P (cfun->machine->frame.mask, regno - GP_REG_FIRST))
+    if (BITSET_P (cfun->machine->frame.mask, regno - GP_REG_FIRST)
+	&& !loongarch_reg_saved_in_fpr_p (regno))
       {
 	/* Special care needs to be taken for $r4-$r7 (EH_RETURN_DATA_REGNO)
 	   when returning normally from a function that calls
@@ -1310,6 +1371,7 @@ loongarch_expand_prologue (void)
       RTX_FRAME_RELATED_P (emit_insn (insn)) = 1;
       size -= step1;
       loongarch_for_each_saved_reg (size, loongarch_save_reg, false);
+      loongarch_save_restore_gpr_in_fpr (true, false);
     }
 
   /* Set up the frame pointer, if we're using one.  */
@@ -1533,6 +1595,9 @@ loongarch_expand_epilogue (int style)
 				loongarch_restore_reg,
 				crtl->calls_eh_return
 				&& style != EXCEPTION_RETURN);
+  loongarch_save_restore_gpr_in_fpr (false,
+			      crtl->calls_eh_return
+			      && style != EXCEPTION_RETURN);
 
   if (need_barrier_p)
     loongarch_emit_stack_tie ();
@@ -8717,7 +8782,8 @@ loongarch_get_separate_components (void)
   gcc_assert (offset % UNITS_PER_WORD == 0);
 
   for (unsigned int regno = GP_REG_FIRST; regno <= GP_REG_LAST; regno++)
-    if (BITSET_P (cfun->machine->frame.mask, regno - GP_REG_FIRST))
+    if (BITSET_P (cfun->machine->frame.mask, regno - GP_REG_FIRST)
+	&& !loongarch_reg_saved_in_fpr_p (regno))
       {
 	/* We can wrap general registers saved at [sp, sp + 32768) using the
 	   ldptr/stptr instructions.  For large offsets a pseudo register
@@ -8802,7 +8868,8 @@ loongarch_process_components (sbitmap components, loongarch_save_restore_fn fn)
   HOST_WIDE_INT offset = cfun->machine->frame.gp_sp_offset;
 
   for (unsigned int regno = GP_REG_FIRST; regno <= GP_REG_LAST; regno++)
-    if (BITSET_P (cfun->machine->frame.mask, regno - GP_REG_FIRST))
+    if (BITSET_P (cfun->machine->frame.mask, regno - GP_REG_FIRST)
+	&& !loongarch_reg_saved_in_fpr_p (regno))
       {
 	if (bitmap_bit_p (components, regno))
 	  loongarch_save_restore_reg (word_mode, regno, offset, fn);

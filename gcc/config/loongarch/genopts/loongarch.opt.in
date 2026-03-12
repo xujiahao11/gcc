@@ -225,6 +225,10 @@ mstrict-align
 Target Mask(STRICT_ALIGN) Save
 Do not generate unaligned memory accesses.
 
+mcallee-save-gpr-in-fpr
+Target Mask(CALLEE_SAVE_GPR_IN_FPR) Save
+Prefer saving callee-saved general registers in available callee-saved floating-point registers.
+
 mmax-inline-memcpy-size=
 Target Joined RejectNegative UInteger Var(la_max_inline_memcpy_size) Init(1024) Save
 -mmax-inline-memcpy-size=SIZE	Set the max size of memcpy to inline, default is 1024.

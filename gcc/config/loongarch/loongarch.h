@@ -1243,6 +1243,9 @@ struct GTY (()) loongarch_frame_info
 
   /* The offset of arg_pointer_rtx from the bottom of the frame.  */
   HOST_WIDE_INT arg_pointer_offset;
+
+  /* Map GPR N to an FPR used as a temporary callee-save slot.  */
+  unsigned char gpr_saved_in_fp[GP_REG_NUM];
 };
 
 struct GTY (()) machine_function
